@@ -20,6 +20,15 @@ declare global {
       CF_AI_GATEWAY_WAI?: string;         // Optional Workers AI gateway override
       CF_AI_GATEWAY_WAI_DIRECT?: string;  // "true" to route Workers AI to its plain REST endpoint
                                           // (no gateway, no cost logs) instead of a named Gateway
+      // Optional deployment-defined model catalog for gateway mode: a JSON array of
+      // {id, name, provider, model} entries (see ai-gateway.ts). When set, it replaces the
+      // built-in SUGGESTED_MODELS list: users see exactly these entries, under these names and in
+      // this order (first = default), and each `id` is a stable identity that resolves to the
+      // provider model behind it. Unset: every SUGGESTED_MODELS entry of an enabled provider.
+      CF_AI_GATEWAY_MODELS?: string;
+      // "false" to stop users adding their own models in gateway mode (the deployment pays for
+      // everything routed through the gateway). Default: allowed, as before.
+      CF_AI_GATEWAY_CUSTOM_MODELS?: string;
       // Note: outside gateway mode, Workers AI (provider "cloudflare") is BYOK like every other
       // provider -- the account ID and API token live in the user's model config, not in env.
 

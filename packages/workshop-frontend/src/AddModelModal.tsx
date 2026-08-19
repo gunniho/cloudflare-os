@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { Dialog, Button, Input, Select, SensitiveInput, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
 import { AiChatAuthorInfo, AiModelConfig, AiModelProvider, AiGatewayInfo, SUGGESTED_MODELS } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
@@ -61,22 +61,22 @@ function decodeSelection(value: string): SelectionType {
 }
 
 // Build the flat list of options for the Select dropdown.
-function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null) {
+function buildOptions(enabledProviders: Set<string> | null, builtInModelIds: Set<string>) {
   const options: { value: string; label: string; provider: string }[] = []
   const providerOrder = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
 
   for (const provider of providerOrder) {
     if (enabledProviders && !enabledProviders.has(provider)) continue
 
-    // In gateway mode, suggested models are already built-in, so don't list them.
-    if (!gatewayMode) {
-      for (const [modelId, model] of Object.entries(SUGGESTED_MODELS[provider])) {
-        options.push({
-          value: encodeSelection(provider, modelId),
-          label: model.name,
-          provider,
-        })
-      }
+    // Suggested models the deployment already offers as built-ins are not listed again. (In
+    // gateway mode without a deployment-defined catalog that is all of them.)
+    for (const [modelId, model] of Object.entries(SUGGESTED_MODELS[provider])) {
+      if (builtInModelIds.has(modelId)) continue
+      options.push({
+        value: encodeSelection(provider, modelId),
+        label: model.name,
+        provider,
+      })
     }
 
     options.push({
@@ -113,6 +113,10 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
   const enabledProviders: Set<string> | null = gatewayMode
     ? new Set(aiConfig.enabledProviders)
     : null
+  const builtInModelIds = useMemo(
+    () => new Set(aiConfig?.enabled ? aiConfig.builtInModelIds : []),
+    [aiConfig],
+  )
 
   // Reset all state when dialog closes
   useEffect(() => {
@@ -147,11 +151,16 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     setApiUrl(sel.provider === 'ollama' ? 'http://localhost:11434' : '')
   }
 
+  const options = buildOptions(enabledProviders, builtInModelIds)
+  // When every suggested model is already built in (gateway mode without a custom catalog), the
+  // list only offers "Other <provider>..." entries, so the control is really a provider picker.
+  const providersOnly = options.every((opt) => opt.value.startsWith('other-'))
+
   const validate = (): boolean => {
     const newErrors: Record<string, string> = {}
 
     if (!selection) {
-      newErrors.selection = gatewayMode ? 'Please select a provider' : 'Please select a model'
+      newErrors.selection = providersOnly ? 'Please select a provider' : 'Please select a model'
     }
 
     if (selection?.type === 'custom') {
@@ -213,7 +222,6 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
     }
   }
 
-  const options = buildOptions(gatewayMode, enabledProviders)
   const showCustomFields = selection?.type === 'custom'
   const example = selection ? exampleModel(selection.provider) : null
   const isOllama = selection?.provider === 'ollama'
@@ -241,9 +249,9 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
         <div className="space-y-4">
           {/* Model / Provider selection */}
           <Select
-            label={gatewayMode ? 'Select Provider' : 'Select Model'}
+            label={providersOnly ? 'Select Provider' : 'Select Model'}
             className="w-full text-sm"
-            placeholder={gatewayMode ? 'Choose a provider...' : 'Choose an AI model...'}
+            placeholder={providersOnly ? 'Choose a provider...' : 'Choose an AI model...'}
             value={selectValue}
             onValueChange={(v) => handleModelSelect(v as string)}
             error={errors.selection}

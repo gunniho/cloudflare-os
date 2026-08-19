@@ -564,13 +564,15 @@ export default function OnboardingWizard({
                       )}
                     </div>
 
-                    <button
-                      onClick={() => setAddModelOpen(true)}
-                      className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-kumo-subtle border border-dashed border-kumo-line rounded-xl hover:border-kumo-fill hover:text-kumo-default hover:bg-kumo-tint transition-colors"
-                    >
-                      <Plus size={14} weight="bold" />
-                      Add new model...
-                    </button>
+                    {(!aiConfig?.enabled || aiConfig.allowCustomModels) && (
+                      <button
+                        onClick={() => setAddModelOpen(true)}
+                        className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-kumo-subtle border border-dashed border-kumo-line rounded-xl hover:border-kumo-fill hover:text-kumo-default hover:bg-kumo-tint transition-colors"
+                      >
+                        <Plus size={14} weight="bold" />
+                        Add new model...
+                      </button>
+                    )}
                   </>
                 )}
               </div>

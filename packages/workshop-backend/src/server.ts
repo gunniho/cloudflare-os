@@ -192,6 +192,8 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       return Promise.resolve({
         enabled: true,
         enabledProviders: [...gwConfig.providers] as AiModelProvider[],
+        builtInModelIds: gwConfig.getModelList().map(model => model.id),
+        allowCustomModels: gwConfig.allowCustomModels,
       });
     } else {
       return Promise.resolve({ enabled: false });

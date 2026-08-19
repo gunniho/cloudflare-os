@@ -5,8 +5,6 @@ import { useAuthenticatedApi } from '../AuthContext'
 import {
   AiChatAuthorInfo,
   AiGatewayInfo,
-  AiModelProvider,
-  SUGGESTED_MODELS,
 } from '@gadgets/workshop-shared/api'
 import {
   Plus,
@@ -22,8 +20,6 @@ import { MENU_CONTENT, MENU_ITEM, MENU_ITEM_DANGER } from '../components/menuSty
 export const Route = createFileRoute('/providers')({ component: ProvidersPage })
 
 // ─── constants ────────────────────────────────────────────────────────────────
-
-const PROVIDER_ORDER = Object.keys(SUGGESTED_MODELS) as AiModelProvider[]
 
 const PRIMARY_BTN =
   'press inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-[13px] font-medium tracking-[-0.25px] text-white transition-colors hover:bg-kumo-brand-hover'
@@ -166,12 +162,12 @@ function ProvidersPage() {
   useEffect(() => { fetchAll() }, [authenticatedApi])
 
   const gatewayMode = aiConfig?.enabled === true
+  // Outside gateway mode every model is the user's own. In gateway mode the deployment decides
+  // whether users may add models on top of its built-in ones.
+  const canAddModels = !aiConfig?.enabled || aiConfig.allowCustomModels
 
-  const isBuiltIn = (modelId: string): boolean => {
-    if (!aiConfig?.enabled) return false
-    const enabled = new Set((aiConfig as Extract<AiGatewayInfo, { enabled: true }>).enabledProviders)
-    return PROVIDER_ORDER.some((p) => enabled.has(p) && modelId in SUGGESTED_MODELS[p])
-  }
+  const isBuiltIn = (modelId: string): boolean =>
+    aiConfig?.enabled === true && aiConfig.builtInModelIds.includes(modelId)
 
   const handleDelete = async (model: AiChatAuthorInfo) => {
     if (!confirm(`Delete "${model.name}"? This cannot be undone.`)) return
@@ -214,10 +210,12 @@ function ProvidersPage() {
             Configure the AI models available to your workspaces.
           </p>
         </div>
-        <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
-          <Plus size={14} weight="bold" />
-          Add provider
-        </button>
+        {canAddModels && (
+          <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
+            <Plus size={14} weight="bold" />
+            Add provider
+          </button>
+        )}
       </header>
 
       {/* Search — hidden when the user has no models */}
@@ -245,8 +243,8 @@ function ProvidersPage() {
                 <Lightning size={15} className="mt-px shrink-0 text-kumo-brand" />
                 <span>
                   <strong className="font-medium text-kumo-default">AI Gateway mode:</strong> built-in
-                  models are managed by your deployment. You can still add custom models with your own
-                  API tokens.
+                  models are managed by your deployment.
+                  {canAddModels && ' You can still add custom models with your own API tokens.'}
                 </span>
               </Notice>
             )}
@@ -288,13 +286,17 @@ function ProvidersPage() {
             <div>
               <p className="text-sm font-medium text-kumo-default">No AI providers yet</p>
               <p className="mt-1 text-[13px] leading-[18px] text-kumo-subtle">
-                Add a provider to start building workspaces with AI.
+                {canAddModels
+                  ? 'Add a provider to start building workspaces with AI.'
+                  : 'Your deployment has not configured any models yet.'}
               </p>
             </div>
-            <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
-              <Plus size={14} weight="bold" />
-              Add your first provider
-            </button>
+            {canAddModels && (
+              <button type="button" onClick={() => setSheetOpen(true)} className={PRIMARY_BTN}>
+                <Plus size={14} weight="bold" />
+                Add your first provider
+              </button>
+            )}
           </div>
         ) : filtered.length === 0 ? (
           <div className="py-12 text-center text-sm text-kumo-inactive">No providers found</div>

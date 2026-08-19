@@ -923,6 +923,16 @@ export type AiModelProvider = "openai" | "anthropic" | "google" | "cloudflare" |
 export type AiGatewayInfo = {
   enabled: true;
   enabledProviders: AiModelProvider[];
+
+  // IDs of the deployment's built-in models (the ones `listModels()` returns that the user did
+  // not add themselves). Built-in models cannot be deleted, and the add-model UI does not offer
+  // them again. With a deployment-defined catalog these are the catalog's own IDs, so the
+  // frontend must not derive built-in-ness from SUGGESTED_MODELS.
+  builtInModelIds: string[];
+
+  // Whether users may add their own models on top of the built-in ones. When false, the
+  // add-model affordances are hidden and `addModel()` is refused.
+  allowCustomModels: boolean;
 } | {
   enabled: false;
 };

@@ -1,12 +1,12 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, BlueprintOutput, OutputSummary, WorkpieceId, ListOutputsResult } from '@gadgets/workshop-shared/api';
 import { Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { createTypedStorage, collection } from "@gadgets/typed-storage";
 import { createWorkshopLogger } from "./observability";
-import { getAiGatewayConfig } from "./ai-gateway.js";
+import { getAiGatewayConfig, type AiGatewayConfig } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
@@ -502,10 +502,24 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.profile.put(profile);
   }
 
+  // Whether the user's own (self-added) models take part in model lookups. Always outside AI
+  // Gateway mode; in gateway mode only when the deployment allows custom models. When it does
+  // not, previously added models are ignored everywhere (list, chat context, preferred model) so
+  // the deployment-defined catalog is the only thing that can spend the deployment's money.
+  private userModelsActive(gwConfig: AiGatewayConfig | null): boolean {
+    return !gwConfig || gwConfig.allowCustomModels;
+  }
+
+  // The user's own model record for `id`, if user models are active (see userModelsActive).
+  private userModel(gwConfig: AiGatewayConfig | null, id: string): UserAiModelRecord | undefined {
+    return this.userModelsActive(gwConfig) ? this.storage.aiModels.get(id) : undefined;
+  }
+
   async listModels(): Promise<AiChatAuthorInfo[]> {
     let result: AiChatAuthorInfo[] = [];
 
-    // When AI Gateway mode is active, include all suggested models for enabled providers.
+    // When AI Gateway mode is active, include the deployment's built-in models (the configured
+    // catalog, or all suggested models for enabled providers).
     let gwConfig = getAiGatewayConfig(this.env);
     let gwModelIds = new Set<string>();
     if (gwConfig) {
@@ -516,9 +530,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     // Also include user-configured models, skipping any that duplicate a gateway model.
-    for (let model of this.storage.aiModels.list()) {
-      if (!gwModelIds.has(model.profile.id)) {
-        result.push(model.profile);
+    if (this.userModelsActive(gwConfig)) {
+      for (let model of this.storage.aiModels.list()) {
+        if (!gwModelIds.has(model.profile.id)) {
+          result.push(model.profile);
+        }
       }
     }
     return result;
@@ -526,6 +542,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
   async addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
     let gwConfig = getAiGatewayConfig(this.env);
+    if (gwConfig && !gwConfig.allowCustomModels) {
+      throw new Error("This deployment does not allow adding your own models.");
+    }
     if (gwConfig && !gwConfig.providers.has(config.provider)) {
       throw new Error(`Provider "${config.provider}" is not available in AI Gateway mode.`);
     }
@@ -535,14 +554,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async deleteModel(id: string): Promise<void> {
-    // In AI Gateway mode, don't allow deleting built-in suggested models.
+    // In AI Gateway mode, don't allow deleting the deployment's built-in models.
     let gwConfig = getAiGatewayConfig(this.env);
-    if (gwConfig) {
-      for (let [provider, models] of Object.entries(SUGGESTED_MODELS)) {
-        if (gwConfig.providers.has(provider) && id in models) {
-          throw new Error(`Cannot delete built-in model "${models[id].name}".`);
-        }
-      }
+    if (gwConfig?.isBuiltIn(id)) {
+      let name = gwConfig.resolveModel(id)!.profile.name;
+      throw new Error(`Cannot delete built-in model "${name}".`);
     }
 
     this.storage.aiModels.delete(id);
@@ -569,7 +585,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (id !== null) {
       // Validate that the model exists in the user's configured models or as a gateway model.
       let gwConfig = getAiGatewayConfig(this.env);
-      let exists = !!this.storage.aiModels.get(id) || !!gwConfig?.resolveModel(id);
+      let exists = !!this.userModel(gwConfig, id) || !!gwConfig?.resolveModel(id);
       if (!exists) {
         throw new Error(`No such model: ${id}`);
       }
@@ -675,7 +691,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
         result.aiModel = gwConfig.resolveModel(modelId);
       }
       if (!result.aiModel) {
-        result.aiModel = this.storage.aiModels.get(modelId);
+        result.aiModel = this.userModel(gwConfig, modelId);
       }
       if (!result.aiModel) throw new Error(`No such model: ${modelId}`);
     }
