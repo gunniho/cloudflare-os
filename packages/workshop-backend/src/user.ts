@@ -1312,6 +1312,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let config = await readAdminConfig(this.env);
     let result: ProvidedAccountInfo[] = [];
     for (let rec of this.#connectedAccountRecords()) {
+      // A connected account can outlive its service binding when a Gatekeeper is removed or
+      // renamed. Keep the stored record dormant for a possible rollback, but never advertise its
+      // singleton or management UI: calls through the persisted RPC stub can no longer succeed.
+      if (!this.vendors.has(rec.vendorId)) continue;
       if (!rec.description.singleton && !rec.description.providesUi) continue;
       // A "disabled" ambient gatekeeper's account stays dormant: don't surface its singleton capsule
       // or management UI. (Its data is preserved, so re-enabling restores it.)
