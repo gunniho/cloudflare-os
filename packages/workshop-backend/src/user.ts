@@ -12,6 +12,12 @@ import type { AdminSettings } from "./admin-settings.js";
 import { isReservedBlueprintKey, readBlueprintKvRecord } from "./blueprint-archive.js";
 import { filterEnabledResources, isResourceDisabled, readAdminConfig } from "./admin-config.js";
 import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
+import {
+  getAccountIdentityKey,
+  reconcileConnectedAccountAliases,
+  replaceConnectedAccountWithFreshGrant,
+  type StableIdentityAccountRecord,
+} from "./connected-account-dedup.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -19,13 +25,14 @@ const logger = createWorkshopLogger("workshop.user");
 // listOutputs() call wakes and how long it waits. The client calls again until catch-up is done.
 const OUTPUTS_BACKFILL_PAGE = 16;
 
-type ConnectedAccountRecord = {
-  id: number;
-  account: Fetcher<GatekeeperUser>;
-  description: AccountDescription;
-  vendorId: string;   // Derived from the GATEKEEPER_ binding name (e.g. "google", "email").
-  credentialExpiresAt?: Date;    // When credentials are expected to expire, if known.
-  credentialsExpired?: boolean;  // Set true by async notification from gatekeeper.
+export type ConnectedAccountRecord = StableIdentityAccountRecord<Fetcher<GatekeeperUser>> & {
+  // vendorId is derived from the GATEKEEPER_ binding name (e.g. "google", "email").
+  // credentialExpiresAt records when credentials are expected to expire, if known.
+  // credentialsExpired is set true by async notification from the gatekeeper.
+  // Existing records with the same vendor-scoped accountIdentityKey are retained because their
+  // account capabilities may already back live workspace gatekeepers. Higher ids become hidden
+  // aliases of the lowest id; neither the record nor its provider grant is deleted automatically.
+  duplicateOf?: number;
   // True if the Workshop created this account automatically via GatekeeperVendor.createAccount()
   // (no OAuth flow), rather than the user connecting it. Such accounts are protected from manual
   // disconnect, since deleting one permanently destroys the user's data in that gatekeeper.
@@ -1365,12 +1372,79 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let seenIds = new Set<number>();
     let vendorDescriptions = new Map<string, Promise<VendorDescription>>();
 
+    function getVendorDescription(vendorId: string): Promise<VendorDescription> {
+      let description = vendorDescriptions.get(vendorId);
+      if (description) return description;
+      let vendor = vendors.get(vendorId);
+      if (!vendor) return Promise.reject(new Error("No such connected-account service."));
+      description = vendor.describe().catch(err => {
+        vendorDescriptions.delete(vendorId);
+        throw err;
+      });
+      vendorDescriptions.set(vendorId, description);
+      return description;
+    }
+
     // Snapshot the admin config once for this subscription. Changes take effect when the client
     // re-subscribes (e.g. on reconnect), matching other deployment config.
     let config = await readAdminConfig(this.env);
     let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
 
+    // Stable-identity vendors opt into a live re-description pass. This upgrades records saved by
+    // older gatekeeper versions before accountIdentityKey existed. Reconciliation only marks
+    // higher ids as hidden aliases; it deliberately preserves every account capability because an
+    // existing workspace may already have sealed that capability into one of its gatekeepers.
+    let records = [...this.#connectedAccountRecords()];
+    await Promise.all(records.map(async record => {
+      let vendorDescription: VendorDescription;
+      try {
+        vendorDescription = await getVendorDescription(record.vendorId);
+      } catch (err) {
+        logger.warn("failed to describe vendor while refreshing account identity", {
+          event: "connected.account.identity.vendor.describe.failed",
+          accountId: record.id, vendorId: record.vendorId, error: err,
+        });
+        return;
+      }
+      if (!vendorDescription.stableAccountIdentity ||
+          getAccountIdentityKey(record.description)) return;
+      try {
+        let description = await record.account.describe();
+        if (!getAccountIdentityKey(description)) {
+          logger.warn("stable-identity vendor returned no valid account identity", {
+            event: "connected.account.identity.missing",
+            accountId: record.id, vendorId: record.vendorId,
+          });
+          return;
+        }
+        record.description = description;
+        connectedAccounts.put(record);
+      } catch (err) {
+        logger.warn("failed to refresh connected account identity", {
+          event: "connected.account.identity.refresh.failed",
+          accountId: record.id, vendorId: record.vendorId, error: err,
+        });
+      }
+    }));
+    for (let changed of reconcileConnectedAccountAliases(records)) {
+      connectedAccounts.put(changed);
+    }
+    // The calls above cross Worker boundaries and therefore allow DO reentrancy. Re-snapshot now,
+    // immediately before attaching the collection subscriber, so an account connected during the
+    // refresh window is neither omitted from the initial list nor missed as a later update.
+    records = [...this.#connectedAccountRecords()];
+    for (let changed of reconcileConnectedAccountAliases(records)) {
+      connectedAccounts.put(changed);
+    }
+
     async function notifyAdd(record: ConnectedAccountRecord) {
+      if (record.duplicateOf !== undefined) {
+        if (seenIds.has(record.id)) {
+          subscriber.remove(record.id);
+          seenIds.delete(record.id);
+        }
+        return;
+      }
       // Ambient (auto-provisioned) accounts only appear in the Connectors list when their vendor is
       // "optional" — i.e. the user opted in and can manage/remove it. "enabled" (forced) accounts have
       // nothing to manage, and "disabled" ones are dormant, so both are hidden.
@@ -1401,15 +1475,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
       let vendorDescription: VendorDescription;
       try {
-        let vendorDescriptionPromise = vendorDescriptions.get(record.vendorId);
-        if (!vendorDescriptionPromise) {
-          vendorDescriptionPromise = vendor.describe().catch(err => {
-            vendorDescriptions.delete(record.vendorId);
-            throw err;
-          });
-          vendorDescriptions.set(record.vendorId, vendorDescriptionPromise);
-        }
-        vendorDescription = await vendorDescriptionPromise;
+        vendorDescription = await getVendorDescription(record.vendorId);
       } catch (err) {
         logger.warn("failed to describe connected account", {
           event: "connected.account.describe.failed",
@@ -1459,7 +1525,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     // #connectedAccountRecords() skips any record that fails to load, so a single stale account
     // (e.g. one whose gatekeeper Worker is no longer bound) doesn't prevent surfacing the others.
-    let promises = [...this.#connectedAccountRecords()].map(record => notifyAdd(record));
+    let promises = records.map(record => notifyAdd(record));
 
     connectedAccounts.subscribe(dbSubscriber);
 
@@ -1504,6 +1570,18 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       }
       await account.account.revoke();
       this.storage.connectedAccounts.delete(accountId);
+      let accountIdentityKey = getAccountIdentityKey(account.description);
+      if (accountIdentityKey) {
+        // Explicit disconnect revokes the provider identity, so remove every local alias for that
+        // identity as well. Do not call revoke() again: provider revocation can be grant-wide, and
+        // the individual capability objects may still be referenced by already-created workspaces.
+        for (let alias of this.#connectedAccountRecords()) {
+          if (alias.vendorId === account.vendorId &&
+              getAccountIdentityKey(alias.description) === accountIdentityKey) {
+            this.storage.connectedAccounts.delete(alias.id);
+          }
+        }
+      }
       // Disconnecting the Cloudflare account also clears the AI Gateway billing state (selected
       // account + cached balance), which is meaningless without the underlying grant.
       if (account.vendorId === CLOUDFLARE_VENDOR_ID) {
@@ -1603,7 +1681,57 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return undefined;
   }
 
+  // Stable account identities are intentionally separate from user-visible uniqueName values.
+  // When a newly-connected account supplies one, refresh legacy records for that vendor so an
+  // account saved before this field existed can still be matched. All matching records remain in
+  // storage; reconciliation only chooses the lowest id as the visible canonical record.
+  async #findConnectedAccountByStableIdentity(
+      vendorId: string, accountIdentityKey: string, excludeId?: number)
+      : Promise<ConnectedAccountRecord | undefined> {
+    let records: ConnectedAccountRecord[] = [];
+    for (let existing of this.#connectedAccountRecords()) {
+      if (existing.id === excludeId || existing.vendorId !== vendorId) continue;
+      if (!getAccountIdentityKey(existing.description)) {
+        try {
+          let description = await existing.account.describe();
+          if (getAccountIdentityKey(description)) {
+            existing.description = description;
+            this.storage.connectedAccounts.put(existing);
+          }
+        } catch (err) {
+          logger.warn("failed to refresh account during stable identity lookup", {
+            event: "connected.account.identity.lookup.refresh.failed",
+            accountId: existing.id, vendorId, error: err,
+          });
+        }
+      }
+      records.push(existing);
+    }
+    for (let changed of reconcileConnectedAccountAliases(records)) {
+      this.storage.connectedAccounts.put(changed);
+    }
+    return records
+      .toSorted((left, right) => left.id - right.id)
+      .find(existing => getAccountIdentityKey(existing.description) === accountIdentityKey &&
+          existing.duplicateOf === undefined);
+  }
+
   async putConnectedAccount(record: ConnectedAccountRecord) {
+    let accountIdentityKey = getAccountIdentityKey(record.description);
+    if (accountIdentityKey) {
+      let existing = await this.#findConnectedAccountByStableIdentity(
+          record.vendorId, accountIdentityKey, record.id);
+      if (existing) {
+        // A repeated OAuth connection has minted a fresh account capability. Keep the canonical
+        // numeric id stable, but point it at the fresh capability. Crucially, do not call revoke()
+        // on either capability: some providers revoke every grant for the user/project, and the old
+        // capability may already be sealed into a live workspace gatekeeper.
+        replaceConnectedAccountWithFreshGrant(existing, record);
+        this.storage.connectedAccounts.put(existing);
+        return;
+      }
+    }
+
     let uniqueName = record.description.uniqueName;
     if (uniqueName &&
         this.#findConnectedAccountByIdentity(record.vendorId, uniqueName, record.id)) {
@@ -1636,6 +1764,13 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     record.credentialsExpired = false;
     record.credentialExpiresAt = expiresAt;
     this.storage.connectedAccounts.put(record);
+    if (getAccountIdentityKey(record.description)) {
+      let records = [...this.#connectedAccountRecords()]
+        .filter(existing => existing.vendorId === record.vendorId);
+      for (let changed of reconcileConnectedAccountAliases(records)) {
+        this.storage.connectedAccounts.put(changed);
+      }
+    }
   }
 
   async getGatekeeperClassFor(accountId: number, url: string)
