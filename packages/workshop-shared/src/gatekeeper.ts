@@ -68,6 +68,12 @@ export type VendorDescription = {
   // The account — not the vendor — declares whether it provides an agent singleton and/or a
   // management UI (see AccountDescription.singleton / .providesUi).
   autoProvisionsAccount?: boolean;
+
+  // True when this vendor's AccountDescription includes a stable `accountIdentityKey`. Workshop
+  // then refreshes stored descriptions before listing accounts so connectors added before the key
+  // existed can be reconciled safely. The key is for presentation-layer deduplication only; it is
+  // not an authentication or authorization claim.
+  stableAccountIdentity?: boolean;
 }
 
 // Per-open context the Workshop passes to GatekeeperUser.startAppUi(). `isAdmin` is supplied fresh
@@ -138,6 +144,12 @@ export type AccountDescription = {
   // Unique, canonical name for this user account. Typically this is what the user would type into
   // the login form when logging in. This may an email address or a Unix-style username.
   uniqueName?: string;
+
+  // Opaque, vendor-scoped identifier for the external account. Unlike `uniqueName`, this value is
+  // never displayed. Workshop uses it only to reconcile repeated connections to the same account.
+  // Gatekeepers must keep it stable, bounded, and non-sensitive (hash provider identifiers before
+  // returning them). It must never be used for authentication, authorization, or storage scoping.
+  accountIdentityKey?: string;
 
   // User's avatar image.
   avatar: AvatarImage;
