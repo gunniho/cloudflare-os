@@ -67,6 +67,15 @@ describe("connected-account stable identity deduplication", () => {
     expect(formerAlias.duplicateOf).toBeUndefined();
   });
 
+  it("repairs a group whose every record was previously marked as an alias", () => {
+    const lowest = record(2, "ga:user-a", { duplicateOf: 9 });
+    const highest = record(9, "ga:user-a", { duplicateOf: 2 });
+
+    expect(reconcileConnectedAccountAliases([highest, lowest])).toEqual([lowest]);
+    expect(lowest.duplicateOf).toBeUndefined();
+    expect(highest.duplicateOf).toBe(2);
+  });
+
   it("moves the fresh capability onto the canonical id without revoking either grant", () => {
     const oldAccount = account();
     const freshAccount = account();

@@ -18,6 +18,7 @@ import {
   replaceConnectedAccountWithFreshGrant,
   type StableIdentityAccountRecord,
 } from "./connected-account-dedup.js";
+import { snapshotVendorDescription } from "./rpc-result.js";
 
 const logger = createWorkshopLogger("workshop.user");
 
@@ -1372,16 +1373,20 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let seenIds = new Set<number>();
     let vendorDescriptions = new Map<string, Promise<VendorDescription>>();
 
-    function getVendorDescription(vendorId: string): Promise<VendorDescription> {
-      let description = vendorDescriptions.get(vendorId);
+    function getVendorDescription(
+        descriptions: Map<string, Promise<VendorDescription>>, vendorId: string)
+        : Promise<VendorDescription> {
+      let description = descriptions.get(vendorId);
       if (description) return description;
       let vendor = vendors.get(vendorId);
       if (!vendor) return Promise.reject(new Error("No such connected-account service."));
-      description = vendor.describe().catch(err => {
-        vendorDescriptions.delete(vendorId);
+      // Snapshot the Workers RPC result before sharing it within one subscription phase. This
+      // strips session metadata and gives concurrent readers one reusable plain value.
+      description = snapshotVendorDescription(() => vendor.describe()).catch(err => {
+        descriptions.delete(vendorId);
         throw err;
       });
-      vendorDescriptions.set(vendorId, description);
+      descriptions.set(vendorId, description);
       return description;
     }
 
@@ -1398,7 +1403,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     await Promise.all(records.map(async record => {
       let vendorDescription: VendorDescription;
       try {
-        vendorDescription = await getVendorDescription(record.vendorId);
+        vendorDescription = await getVendorDescription(vendorDescriptions, record.vendorId);
       } catch (err) {
         logger.warn("failed to describe vendor while refreshing account identity", {
           event: "connected.account.identity.vendor.describe.failed",
@@ -1436,8 +1441,12 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     for (let changed of reconcileConnectedAccountAliases(records)) {
       connectedAccounts.put(changed);
     }
+    // Identity refresh and account advertisement are separate RPC phases. Start advertisement with
+    // a fresh vendor-description snapshot rather than carrying an RPC result across that boundary.
+    vendorDescriptions.clear();
 
-    async function notifyAdd(record: ConnectedAccountRecord) {
+    async function notifyAdd(
+        descriptions: Map<string, Promise<VendorDescription>>, record: ConnectedAccountRecord) {
       if (record.duplicateOf !== undefined) {
         if (seenIds.has(record.id)) {
           subscriber.remove(record.id);
@@ -1475,7 +1484,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
       let vendorDescription: VendorDescription;
       try {
-        vendorDescription = await getVendorDescription(record.vendorId);
+        vendorDescription = await getVendorDescription(descriptions, record.vendorId);
       } catch (err) {
         logger.warn("failed to describe connected account", {
           event: "connected.account.describe.failed",
@@ -1505,10 +1514,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     let dbSubscriber = {
       async add(record: ConnectedAccountRecord) {
-        await notifyAdd(record);
+        await notifyAdd(new Map(), record);
       },
       async update(oldRecord: ConnectedAccountRecord, newRecord: ConnectedAccountRecord) {
-        await notifyAdd(newRecord);
+        await notifyAdd(new Map(), newRecord);
       },
       remove(record: ConnectedAccountRecord): void {
         if (seenIds.has(record.id)) {
@@ -1525,7 +1534,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
     // #connectedAccountRecords() skips any record that fails to load, so a single stale account
     // (e.g. one whose gatekeeper Worker is no longer bound) doesn't prevent surfacing the others.
-    let promises = records.map(record => notifyAdd(record));
+    let promises = records.map(record => notifyAdd(vendorDescriptions, record));
 
     connectedAccounts.subscribe(dbSubscriber);
 
